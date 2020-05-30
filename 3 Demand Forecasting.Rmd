@@ -1,0 +1,607 @@
+---
+title: "Demand Forecasting"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+rm(list=ls())
+```
+
+```{r}
+library(fpp2)
+library(fpp)
+library(tidyverse)
+library(dplyr)
+library(forecast)
+library(prophet)
+
+df = read.csv("Price_Rev_Hotel_Clean.csv",sep = '\t')
+
+df['date'] = paste(df$arrival_date_day_of_month,df$arrival_date_month,df$arrival_date_year, sep="-")
+
+df$date = as.POSIXct(df$date, format = "%d-%B-%Y", tz="UTC")
+
+df_adr = df %>% group_by(date,hotel) %>% summarise(avg_price = mean(adr))
+
+df_r = df %>% filter(hotel == "Resort Hotel")
+
+View(df_r)
+
+df_r$stay = df_r$stays_in_week_nights + df_r$stays_in_week_nights
+df_r$stay = ifelse(df_r$stay==0,1,df_r$stay)
+
+time_seq = seq(from = as.POSIXct("2015-07-01", tz="UTC"), 
+              to = as.POSIXct("2017-08-31", tz="UTC"), by = "day")
+
+df_resort = data.frame(date=time_seq)
+
+df_resort$bookings = 0
+
+for(i in 1:nrow(df_r)){
+  d = df_r[i,'date']
+  s = df_r[i,'stay']
+  id = which(df_resort$date == d)
+  df_resort[(id:(id+s-1)),'bookings'] = df_resort[(id:(id+s-1)),'bookings'] + 1
+}
+
+# View(df_resort)
+
+df_resort = df_resort %>% filter(!is.na(date))
+
+df_resort$dow = format(df_resort$date,format="%u")  
+df_resort$month = format(df_resort$date,format="%m")
+df_resort$year = format(df_resort$date,format="%Y")
+
+df_resort$dow = as.factor(df_resort$dow)
+df_resort$month = as.factor(df_resort$month)
+df_resort$year = as.factor(df_resort$year)
+
+df_resort$log_bookings = log(df_resort$bookings)
+
+df_resort = merge(df_resort, df_adr[df_adr$hotel=="Resort Hotel",], by="date", all=TRUE)
+
+View(df_resort)
+
+```
+
+```{r}
+# ARIMA and dynamic regression
+library(lubridate)
+
+y = ts(df_resort[(6:793),]$bookings, frequency=7)
+ 
+x = df_resort[(6:793),] %>% dplyr::select("month", "year", 'avg_price') %>% ts(frequency = 7)
+
+y.tr = window(y, end = c(109,1), frequency=7)
+y.te = window(y, start = c(109,2), end = c(113,4), frequency = 7)
+
+x.tr = window(x, end = c(109,1), frequency=7)
+x.te = window(x, start = c(109,2), end = c(113,4), frequency = 7)
+
+y.tr %>%
+  ggtsdisplay(lag=120)
+
+adf.test(y.tr, alternative='stationary')
+
+L <- BoxCox.lambda(y.tr)
+
+# plotting the differenced time series to determine d, D
+y.tr %>%
+  diff(lag=7) %>%
+  diff() %>% 
+  diff(lag=7) %>%
+  ggtsdisplay(lag=120) # can plot only univariate time series
+
+```
+
+
+```{r}
+# ARIMA - manual
+
+model = Arima(y.tr, order=c(0,1,0), seasonal=c(1,2,2), lambda=L)
+
+fc.A = model %>%
+  forecast(h=31)
+
+checkresiduals(fc.A)
+
+accuracy(fc.A,y.te)
+
+fc.A %>% autoplot() + autolayer(y.te, series = "Actual") + xlim(100,114)
+
+```
+
+```{r}
+# ARIMA - auto
+
+model = auto.arima(y.tr, lambda=L)
+
+fc.AA = model %>%
+  forecast(h=31)
+
+checkresiduals(fc.AA)
+
+accuracy(fc.AA,y.te)
+
+fc.AA %>% autoplot() + autolayer(y.te, series = "Actual") + xlim(100,114)
+
+```
+
+
+```{r}
+# Dynamic regression - Manual
+
+model = Arima(y.tr, order=c(2,1,1), seasonal=c(2,0,1), xreg = x.tr, lambda=L)
+
+fc.D = model %>%
+  forecast(h=31, xreg = x.te)
+
+checkresiduals(fc.D)
+
+accuracy(fc.D,y.te)
+
+fc.D %>% autoplot() + autolayer(y.te, series = "Actual") + xlim(100,114)
+
+```
+
+```{r}
+# Dynamic regression - Auto
+
+model = auto.arima(y.tr, xreg = x.tr, lambda=L)
+
+fc.AD = model %>%
+  forecast(h=31, xreg = x.te)
+
+checkresiduals(fc.AD)
+
+accuracy(fc.AD,y.te)
+
+fc.AD %>% autoplot() + autolayer(y.te, series = "Actual") + xlim(100,114)
+
+```
+
+
+
+```{r}
+# TBATS model
+
+x.msts <- msts(df_resort[(1:762),]$bookings ,seasonal.periods=c(7,365.25))
+
+model <- tbats(x.msts)
+
+fc.tbats = forecast(model,h=31)
+
+plot(fc.tbats)
+
+fc.tbats = as.data.frame(fc.tbats)
+fc.tbats$y = df_resort[(763:793),]$bookings
+
+fc.tbats$mape = abs(fc.tbats$`Point Forecast`-fc.tbats$y)*100/fc.tbats$y
+
+mean(fc.tbats$mape)
+
+```
+
+
+```{r}
+# Prophet model
+
+regressor_list = c('dow', 'month', 'year', 'avg_price')
+
+df_pro = df_resort %>% dplyr::select(ds=date, y=bookings, regressor_list)
+
+df.tr = df_pro[(1:762),]
+df.te = df_pro[(763:793),]
+
+# outlier treatment
+q = as.list(quantile(df.tr$y, probs = c(0.05,0.95),na.rm=T))
+df.tr$y = ifelse(df.tr$y<=q[[1]],NA,df.tr$y)
+df.tr$y = ifelse(df.tr$y>=q[[2]],NA,df.tr$y)
+
+m <- prophet(changepoint.prior.scale=0.01, seasonality.prior.scale = 1, changepoint.range = 0.8, holidays.prior.scale = 10)   
+
+for (reg in regressor_list) { 
+  m <- add_regressor(m, reg) 
+}
+
+m <- add_country_holidays(m, country_name = 'US')
+# to check which holidays are included
+# m$train.holiday.names
+
+m <- fit.prophet(m, df.tr)
+
+future <- make_future_dataframe(m, periods = 31)
+
+for (reg in regressor_list) { 
+  future[reg] <- df_pro[reg] 
+}
+
+forecast <- predict(m, future)
+# prophet_plot_components(m, forecast)
+dyplot.prophet(m, forecast)
+
+forecast = (as.data.frame(forecast))
+
+forecast$y = df_pro$y
+
+# View(forecast)
+
+forecast$mape = abs(forecast$yhat-forecast$y)*100/forecast$y
+
+mean(forecast[(763:793),]$mape)
+
+```
+
+
+########################### City Hotel #################################
+
+```{r}
+df_c = df %>% filter(hotel == "City Hotel")
+
+View(df_c)
+
+df_c$stay = df_c$stays_in_week_nights + df_c$stays_in_week_nights
+df_c$stay = ifelse(df_c$stay==0,1,df_c$stay)
+
+time_seq = seq(from = as.POSIXct("2015-07-01", tz="UTC"), 
+              to = as.POSIXct("2017-08-31", tz="UTC"), by = "day")
+
+df_city = data.frame(date=time_seq)
+
+df_city$bookings = 0
+
+for(i in 1:nrow(df_c)){
+  d = df_c[i,'date']
+  s = df_c[i,'stay']
+  id = which(df_city$date == d)
+  df_city[(id:(id+s-1)),'bookings'] = df_city[(id:(id+s-1)),'bookings'] + 1
+}
+
+df_city = df_city %>% filter(!is.na(date))
+
+df_city$dow = format(df_city$date,format="%u")  
+df_city$month = format(df_city$date,format="%m")
+df_city$year = format(df_city$date,format="%Y")
+
+df_city$dow = as.factor(df_city$dow)
+df_city$month = as.factor(df_city$month)
+df_city$year = as.factor(df_city$year)
+
+df_city$log_bookings = log(df_city$bookings)
+
+df_city = merge(df_city, df_adr[df_adr$hotel=="City Hotel",], by="date", all=TRUE)
+
+View(df_city)
+
+```
+
+```{r}
+# ARIMA and dynamic regression
+library(lubridate)
+
+y = ts(df_city[(6:793),]$bookings, frequency=7)
+ 
+x = df_city[(6:793),] %>% dplyr::select("month", "year", 'avg_price') %>% ts(frequency = 7)
+
+y.tr = window(y, end = c(109,1), frequency=7)
+y.te = window(y, start = c(109,2), end = c(113,4), frequency = 7)
+
+x.tr = window(x, end = c(109,1), frequency=7)
+x.te = window(x, start = c(109,2), end = c(113,4), frequency = 7)
+
+y.tr %>%
+  ggtsdisplay(lag=120)
+
+adf.test(y.tr, alternative='stationary')
+
+L <- BoxCox.lambda(y.tr)
+
+# plotting the differenced time series to determine d, D
+y.tr %>%
+  diff(lag=7) %>%
+  diff() %>% 
+  diff(lag=7) %>%
+  ggtsdisplay(lag=120) # can plot only univariate time series
+
+```
+
+```{r}
+# ARIMA - auto
+
+model = auto.arima(y.tr, lambda = L)
+
+fc.AA = model %>%
+  forecast(h=31)
+
+checkresiduals(fc.AA)
+
+accuracy(fc.AA,y.te)
+
+fc.AA %>% autoplot() + autolayer(y.te, series = "Actual") + xlim(100,114)
+
+```
+
+```{r}
+# ARIMA - manual
+
+model = Arima(y.tr, order=c(0,1,1), seasonal=c(0,2,2), lambda = L)
+
+fc.A = model %>%
+  forecast(h=31)
+
+checkresiduals(fc.A)
+
+accuracy(fc.A,y.te)
+
+fc.A %>% autoplot() + autolayer(y.te, series = "Actual") + xlim(100,114)
+
+```
+
+```{r}
+# Dynamic regression - Auto
+
+model = auto.arima(y.tr, xreg = x.tr, lambda = L)
+
+fc.AD = model %>%
+  forecast(h=31, xreg = x.te)
+
+checkresiduals(fc.AD)
+
+accuracy(fc.AD,y.te)
+
+fc.AD %>% autoplot() + autolayer(y.te, series = "Actual") + xlim(100,114)
+
+```
+
+```{r}
+# Dynamic regression - Manual
+
+model = Arima(y.tr, order=c(1,0,1), seasonal=c(1,0,2), xreg = x.tr, lambda = L)
+
+fc.D = model %>%
+  forecast(h=31, xreg = x.te)
+
+checkresiduals(fc.D)
+
+accuracy(fc.D,y.te)
+
+fc.D %>% autoplot() + autolayer(y.te, series = "Actual") + xlim(100,114)
+
+```
+
+# Shrink the train window to reduce noise (start at 2016-07-04)
+
+```{r}
+
+y = ts(df_city[(370:793),]$bookings, frequency=7)
+ 
+x = df_city[(370:793),] %>% dplyr::select("month", "year", 'avg_price') %>% ts(frequency = 7)
+
+y.tr = window(y, end = c(57,1), frequency=7)
+y.te = window(y, start = c(57,2), end = c(61,4), frequency = 7)
+
+x.tr = window(x, end = c(57,1), frequency=7)
+x.te = window(x, start = c(57,2), end = c(61,4), frequency = 7)
+
+View(df_city)
+
+```
+
+
+```{r}
+# ARIMA - auto
+
+model = auto.arima(y.tr, lambda = L)
+
+fc.AA = model %>%
+  forecast(h=31)
+
+checkresiduals(fc.AA)
+
+accuracy(fc.AA,y.te)
+
+fc.AA %>% autoplot() + autolayer(y.te, series = "Actual") + xlim(50,61)
+
+```
+
+```{r}
+# ARIMA - manual
+
+model = Arima(y.tr, order=c(0,1,1), seasonal=c(0,2,2), lambda = L)
+
+fc.A = model %>%
+  forecast(h=31)
+
+checkresiduals(fc.A)
+
+accuracy(fc.A,y.te)
+
+fc.A %>% autoplot() + autolayer(y.te, series = "Actual") + xlim(50,61)
+
+```
+
+```{r}
+# Dynamic regression - Auto
+
+model = auto.arima(y.tr, xreg = x.tr, lambda = L)
+
+fc.AD = model %>%
+  forecast(h=31, xreg = x.te)
+
+checkresiduals(fc.AD)
+
+accuracy(fc.AD,y.te)
+
+fc.AD %>% autoplot() + autolayer(y.te, series = "Actual") + xlim(50,61)
+
+```
+
+```{r}
+# Dynamic regression - Manual
+
+model = Arima(y.tr, order=c(1,0,1), seasonal=c(1,0,2), xreg = x.tr, lambda = L)
+
+fc.D = model %>%
+  forecast(h=31, xreg = x.te)
+
+checkresiduals(fc.D)
+
+accuracy(fc.D,y.te)
+
+fc.D %>% autoplot() + autolayer(y.te, series = "Actual") + xlim(50,61)
+
+```
+
+
+
+```{r}
+# TBATS model
+
+x.msts <- msts(df_city[(1:762),]$bookings ,seasonal.periods=c(7,365.25))
+
+model <- tbats(x.msts)
+
+fc.tbats = forecast(model,h=31)
+
+plot(fc.tbats)
+
+fc.tbats = as.data.frame(fc.tbats)
+fc.tbats$y = df_city[(763:793),]$bookings
+
+fc.tbats$mape = abs(fc.tbats$`Point Forecast`-fc.tbats$y)*100/fc.tbats$y
+
+mean(fc.tbats$mape)
+
+```
+
+# Shrink the train window to reduce noise (start at 2016-07-01)
+
+```{r}
+# TBATS model
+
+x.msts <- msts(df_city[(367:762),]$bookings ,seasonal.periods=c(7,365.25))
+
+model <- tbats(x.msts)
+
+fc.tbats = forecast(model,h=31)
+
+plot(fc.tbats)
+
+fc.tbats = as.data.frame(fc.tbats)
+fc.tbats$y = df_city[(763:793),]$bookings
+
+fc.tbats$mape = abs(fc.tbats$`Point Forecast`-fc.tbats$y)*100/fc.tbats$y
+
+mean(fc.tbats$mape)
+
+```
+
+
+```{r}
+# Prophet model
+
+regressor_list = c('dow', 'month', 'year', 'avg_price')
+
+df_pro = df_city %>% dplyr::select(ds=date, y=bookings, regressor_list)
+
+df.tr = df_pro[(1:762),]
+df.te = df_pro[(763:793),]
+
+# outlier treatment
+q = as.list(quantile(df.tr$y, probs = c(0.05,0.95),na.rm=T))
+df.tr$y = ifelse(df.tr$y<=q[[1]],NA,df.tr$y)
+df.tr$y = ifelse(df.tr$y>=q[[2]],NA,df.tr$y)
+
+m <- prophet(changepoint.prior.scale=0.01, seasonality.prior.scale = 1, changepoint.range = 0.8, holidays.prior.scale = 10)   
+
+for (reg in regressor_list) { 
+  m <- add_regressor(m, reg) 
+}
+
+m <- add_country_holidays(m, country_name = 'US')
+# to check which holidays are included
+# m$train.holiday.names
+
+m <- fit.prophet(m, df.tr)
+
+future <- make_future_dataframe(m, periods = 31)
+
+for (reg in regressor_list) { 
+  future[reg] <- df_pro[reg] 
+}
+
+forecast <- predict(m, future)
+# prophet_plot_components(m, forecast)
+dyplot.prophet(m, forecast)
+
+forecast = (as.data.frame(forecast))
+
+forecast$y = df_pro$y
+
+# View(forecast)
+
+forecast$mape = abs(forecast$yhat-forecast$y)*100/forecast$y
+
+mean(forecast[(763:793),]$mape)
+
+```
+
+# Shrink the train window to reduce noise (start at 2016-07-01)
+
+```{r}
+
+# Prophet model
+
+regressor_list = c('dow', 'month', 'year', 'avg_price')
+
+df_pro = df_city %>% dplyr::select(ds=date, y=bookings, regressor_list)
+
+View(df_pro)
+
+df.tr = df_pro[(367:762),]
+df.te = df_pro[(763:793),]
+
+# outlier treatment
+q = as.list(quantile(df.tr$y, probs = c(0.05,0.95),na.rm=T))
+df.tr$y = ifelse(df.tr$y<=q[[1]],NA,df.tr$y)
+df.tr$y = ifelse(df.tr$y>=q[[2]],NA,df.tr$y)
+
+m <- prophet(changepoint.prior.scale=0.01, seasonality.prior.scale = 1, changepoint.range = 0.8, holidays.prior.scale = 10)   
+
+for (reg in regressor_list) { 
+  m <- add_regressor(m, reg) 
+}
+
+m <- add_country_holidays(m, country_name = 'US')
+# to check which holidays are included
+# m$train.holiday.names
+
+m <- fit.prophet(m, df.tr)
+
+future <- make_future_dataframe(m, periods = 31)
+
+for (reg in regressor_list) { 
+  future[reg] <- df_pro[(367:793),reg] 
+}
+
+forecast <- predict(m, future)
+# prophet_plot_components(m, forecast)
+dyplot.prophet(m, forecast)
+
+forecast = (as.data.frame(forecast))
+
+forecast$y = df_pro[(367:793),]$y
+
+# View(forecast)
+
+forecast$mape = abs(forecast$yhat-forecast$y)*100/forecast$y
+
+mean(forecast[(397:427),]$mape)
+
+```
+
+
